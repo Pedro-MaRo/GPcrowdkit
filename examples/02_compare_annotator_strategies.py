@@ -18,12 +18,11 @@ import numpy as np
 import tensorflow as tf
 
 from gpcrowdkit import (
+    ALL_ANNOTATOR_STRATEGIES,
+    FeatDepVariationalDirichletAnnotator,
     FreeCategoricalZ,
     GPCrowdModel,
-    OneCoinAnnotator,
     SVGPLatent,
-    SoftmaxPointAnnotator,
-    VariationalDirichletAnnotator,
     init_alpha_tilde,
     make_synthetic,
     train,
@@ -37,12 +36,16 @@ def accuracy(pred: np.ndarray, true: np.ndarray) -> float:
 
 def build_annotator(cls: type[AnnotatorModel], labels, class_probs) -> AnnotatorModel:
     """The only place that knows which strategy is which."""
-    if cls is VariationalDirichletAnnotator:
+    if cls is ALL_ANNOTATOR_STRATEGIES[0]:
         return cls(
             labels.num_workers,
             labels.num_classes,
             alpha_tilde_init=init_alpha_tilde(labels, class_probs),
         )
+    if cls is FeatDepVariationalDirichletAnnotator:
+        # This strategy produces a different confusion matrix for each item via X,
+        # so it does not use the static alpha_tilde initialisation.
+        return cls(labels.num_workers, labels.num_classes, hidden_units=[32, 32])
     return cls(labels.num_workers, labels.num_classes)
 
 
@@ -57,13 +60,13 @@ def main() -> None:
     class_probs = labels.empirical_class_probs()
     mv_acc = accuracy(labels.majority_vote(), data.z)
 
-    ## Strategies: - VariationalDirichletAnnotator: 3 params per worker, 
-    #                   returns a Dirichlet distribution over the confusion matrix of each worker.
-    #             - SoftmaxPointAnnotator: 3 params per worker, returns a single point estimate of the confusion matrix of each worker.
-    #             - OneCoinAnnotator: 1 param per worker: prob of being right. Errors distribute uniformly 
-    #                       among the other classes.                                 
+    ## Strategies:
+    # - VariationalDirichletAnnotator: full Dirichlet posterior over each worker confusion matrix.
+    # - SoftmaxPointAnnotator: deterministic point estimate with the same parameter count.
+    # - OneCoinAnnotator: one scalar per worker; errors spread uniformly across the other classes.
+    # - FeatDepDirichletAnnotator: feature-dependent confusion matrices given X.
 
-    strategies = [VariationalDirichletAnnotator, SoftmaxPointAnnotator, OneCoinAnnotator]
+    strategies = list(ALL_ANNOTATOR_STRATEGIES)
     print(f"{'strategy':<28s} {'params/worker':>14s} {'accuracy':>10s} {'final elbo':>12s}")
     print(f"{'majority vote (baseline)':<28s} {'-':>14s} {mv_acc:>10.3f} {'-':>12s}")
 

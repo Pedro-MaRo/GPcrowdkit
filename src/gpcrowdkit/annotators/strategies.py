@@ -7,13 +7,14 @@ anywhere else in the library.
 
 They span the useful range of complexity:
 
-============================  ==================  ==============================
-Strategy                      Parameters          Worker uncertainty
-============================  ==================  ==============================
-VariationalDirichletAnnotator ``A * C * C``       full posterior over ``R``
-SoftmaxPointAnnotator         ``A * C * C``       none (point estimate)
-OneCoinAnnotator              ``A``               none (point estimate)
-============================  ==================  ==============================
+============================            ==================  ==============================
+Strategy                                Parameters          Worker uncertainty
+============================            ==================  ==============================
+VariationalDirichletAnnotator           ``A * C * C``       full posterior over ``R``
+SoftmaxPointAnnotator                   ``A * C * C``       none (point estimate)
+OneCoinAnnotator                        ``A``               none (point estimate)
+FeatDepDirichletAnnotator               ``N * A * C * C``   full posterior over ``R``
+============================            ==================  ==============================
 
 [OneCoinAnnotator][gpcrowdkit.annotators.strategies.OneCoinAnnotator] is the one that justifies the shape of the base
 class. It carries a single scalar per worker, so an interface promising an
@@ -32,14 +33,17 @@ import numpy as np
 import tensorflow as tf
 from gpflow.utilities import positive
 
-from ..data import CrowdLabels
-from .base import ConfusionAnnotator
+from ..data import CrowdBatch, CrowdLabels
+from .base import AnnotatorModel, ConfusionAnnotator
 
 __all__ = [
     "VariationalDirichletAnnotator",
     "SoftmaxPointAnnotator",
     "OneCoinAnnotator",
+    "FeatDepDirichletAnnotator",
+    "FeatDepVariationalDirichletAnnotator",
     "init_alpha_tilde",
+    "ALL_ANNOTATOR_STRATEGIES",
 ]
 
 FLOAT = tf.float64
@@ -102,10 +106,12 @@ class VariationalDirichletAnnotator(ConfusionAnnotator):
         """
         super().__init__(num_workers, num_classes)
         shape = (self.A, self.C, self.C)
-
+        # Adapt the alpha_prior to the shape and type required by the flow.
         prior = np.broadcast_to(np.asarray(alpha_prior, dtype=np.float64), shape).copy()
+        # Set the prior as a gpflow parameter and lock it to non-trainable.
         self.alpha = gpflow.Parameter(prior, transform=positive(), trainable=False)
 
+        # By default, initialise the annotators to be better than random (1+1/C on the diagonal, 1/C off-diagonal).
         if alpha_tilde_init is None:
             alpha_tilde_init = np.full(shape, 1.0 / self.C) + np.stack(
                 [np.eye(self.C) for _ in range(self.A)]
@@ -375,3 +381,113 @@ def init_alpha_tilde(
     acc *= (counts / counts.sum(axis=1, keepdims=True))[:, :, None]
     acc /= acc.sum(axis=1, keepdims=True)
     return acc + prior_strength
+
+
+class FeatDepDirichletAnnotator(AnnotatorModel):
+    """ Variational Dirichlet Strategy with feature-dependent confusion matrices. 
+    
+    note: It inherits from AnnotatorModel instead of ConfusionAnnotator because
+    the confusion matrices are now dependent on the input features X, and the implementation
+    doesn't match the structure of ConfusionAnnotator.
+
+    """
+
+    def __init__(
+        self,
+        num_workers: int,
+        num_classes: int,
+        hidden_units: list[int] = [64, 64],
+        alpha_prior: float = 1.0,
+        name: str | None = None,
+    ) -> None:
+        super().__init__(num_workers, num_classes, name=name)
+
+        # Non-trainable alpha prior [1,A,C,C] for broadcasting over batch B.
+        prior_array = np.full((1, self.A, self.C, self.C), alpha_prior, dtype=np.float64)
+        self.alpha = gpflow.Parameter(prior_array, transform=positive(), trainable=False)
+
+        # Neural network X -> [B, A * C * C]
+        layers = []
+        for units in hidden_units:
+            layers.append(tf.keras.layers.Dense(units, activation="relu", dtype=FLOAT))
+        layers.append(tf.keras.layers.Dense(self.A * self.C * self.C, dtype=FLOAT))
+        self.net = tf.keras.Sequential(layers)
+        # Internal cache of tensor X of actual batch, for kl_divergence()
+        self._last_X: tf.Tensor | None = None
+
+    def get_alpha_tilde(self, X: tf.Tensor) -> tf.Tensor:
+        """
+        Returns alpha_tilde(X) with shape [B, A, C, C]
+        """
+        B = tf.shape(X)[0]
+        raw_out = self.net(X)
+        reshaped = tf.reshape(raw_out, (B, self.A, self.C, self.C))
+        return tf.nn.softplus(reshaped) + 1e-3
+
+    def expected_log_confusion_all(self, X: tf.Tensor) -> tf.Tensor:
+        """
+        Expected log-confusion: E_q[log(R|X)], with shape [B, A, C, C]
+        """
+        a = self.get_alpha_tilde(X)
+        return tf.math.digamma(a) - tf.math.digamma(tf.reduce_sum(a, axis=2, keepdims=True))
+
+    def label_log_terms(self, batch: CrowdBatch) -> tf.Tensor:
+        """
+        Base Contract: Returns [L,C] for each one of the L annotations of the batch
+        """
+        X = batch.X
+        self._last_X = X  # Guardar referencia para kl_divergence()
+
+        # Matriz completa log-esperada para el lote: [B, A, C_obs, C_true]
+        E_log_R = self.expected_log_confusion_all(X)
+
+        # Mapear L anotaciones a (índice local del ítem [0..B-1], anotador, etiqueta observada)
+        idx = tf.stack([batch.item_local, batch.worker_idx, batch.label], axis=-1)  # [L, 3]
+
+        # Extraer el vector sobre las C_true clases candidatas -> [L, C_true]
+        return tf.gather_nd(E_log_R, idx)
+
+    def kl_divergence(self) -> tf.Tensor:
+        """
+        Base Contract: Returns KL-divergence scalar over the batch.
+        """
+        if self._last_X is None:
+            return tf.constant(0.0, dtype=FLOAT)
+
+        q = self.get_alpha_tilde(self._last_X)  # [B, A, C_obs, C_true]
+        p = self.alpha                         # [1, A, C_obs, C_true]
+
+        diff = q - p
+        term1 = tf.reduce_sum(diff * tf.math.digamma(q))
+        term2 = -tf.reduce_sum(
+            tf.math.digamma(tf.reduce_sum(q, axis=2, keepdims=True))
+            * tf.reduce_sum(diff, axis=2, keepdims=True)
+        )
+
+        q_trans = tf.transpose(q, perm=[0, 1, 3, 2])
+        p_trans = tf.transpose(p, perm=[0, 1, 3, 2])
+        term3 = tf.reduce_sum(tf.math.lbeta(p_trans) - tf.math.lbeta(q_trans))
+
+        return term1 + term2 + term3
+
+    def confusion_matrices(self, X: tf.Tensor | None = None) -> tf.Tensor:
+        """
+        Posterior mean of the confusion matrices: shape [B, A, C, C] (one matrix CxC per
+        annotator and item in the batch). If X is None, uses the last batch's X.
+        """
+        target_X = X if X is not None else self._last_X
+        if target_X is None:
+            raise ValueError("Se requiere pasar X o haber ejecutado label_log_terms previamente.")
+        a = self.get_alpha_tilde(target_X)
+        return a / tf.reduce_sum(a, axis=2, keepdims=True)
+
+
+ALL_ANNOTATOR_STRATEGIES = (
+    VariationalDirichletAnnotator,
+    SoftmaxPointAnnotator,
+    OneCoinAnnotator,
+    FeatDepDirichletAnnotator,
+)
+
+# Backward-compatible alias: some examples and docs use the longer, explicit name.
+FeatDepVariationalDirichletAnnotator = FeatDepDirichletAnnotator

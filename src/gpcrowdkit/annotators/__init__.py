@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from .base import AnnotatorModel, ConfusionAnnotator
 from .strategies import (
+    ALL_ANNOTATOR_STRATEGIES,
+    FeatDepDirichletAnnotator,
+    FeatDepVariationalDirichletAnnotator,
     OneCoinAnnotator,
     SoftmaxPointAnnotator,
     VariationalDirichletAnnotator,
@@ -21,5 +24,8 @@ __all__ = [
     "VariationalDirichletAnnotator",
     "SoftmaxPointAnnotator",
     "OneCoinAnnotator",
+    "FeatDepDirichletAnnotator",
+    "FeatDepVariationalDirichletAnnotator",
+    "ALL_ANNOTATOR_STRATEGIES",
     "init_alpha_tilde",
 ]

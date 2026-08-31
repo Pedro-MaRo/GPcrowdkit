@@ -47,6 +47,9 @@ from __future__ import annotations
 
 from .annotators.base import AnnotatorModel, ConfusionAnnotator
 from .annotators.strategies import (
+    ALL_ANNOTATOR_STRATEGIES,
+    FeatDepDirichletAnnotator,
+    FeatDepVariationalDirichletAnnotator,
     OneCoinAnnotator,
     SoftmaxPointAnnotator,
     VariationalDirichletAnnotator,
@@ -84,6 +87,9 @@ __all__ = [
     "VariationalDirichletAnnotator",
     "SoftmaxPointAnnotator",
     "OneCoinAnnotator",
+    "FeatDepDirichletAnnotator",
+    "FeatDepVariationalDirichletAnnotator",
+    "ALL_ANNOTATOR_STRATEGIES",
     "init_alpha_tilde",
     # posteriors
     "PosteriorZ",

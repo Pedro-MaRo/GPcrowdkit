@@ -17,10 +17,11 @@ import numpy as np
 import tensorflow as tf
 
 from gpcrowdkit import (
-    FreeCategoricalZ,   # Posterior distribution
-    GPCrowdModel,   # Model class
-    SVGPLatent,     # Structure for latent true classes
-    VariationalDirichletAnnotator,  # Annotator's behaviour (I have some doubts)
+    FeatDepVariationalDirichletAnnotator,
+    FreeCategoricalZ,
+    GPCrowdModel,
+    SVGPLatent,
+    VariationalDirichletAnnotator,
     init_alpha_tilde,
     make_synthetic,
     train,
@@ -48,66 +49,82 @@ def main() -> None:
     print(labels)
 
     # Initialise q(Z) and the annotator concentrations from the vote histogram,
-    # using Laplace smoothing to avoid null probabilities. 
-    class_probs = labels.empirical_class_probs() # It is empty, contains only 
-                                                 # the method: to be used forward.
+    # using Laplace smoothing to avoid null probabilities.
+    class_probs = labels.empirical_class_probs()
 
-    model = GPCrowdModel(
-        latent=SVGPLatent( ##!! Study SVGPCRLatent file
+    # Baseline variant: static confusion matrices, shared across all items.
+    baseline_model = GPCrowdModel(
+        latent=SVGPLatent(
             kernel=gpflow.kernels.SquaredExponential(lengthscales=2.0),
             num_classes=labels.num_classes,
             inducing_points=data.X[:25].copy(),
         ),
-        annotator=VariationalDirichletAnnotator( ##!! Study VariationalDirichletAnnotator file
+        annotator=VariationalDirichletAnnotator(
             labels.num_workers,
             labels.num_classes,
             alpha_tilde_init=init_alpha_tilde(labels, class_probs),
         ),
         num_data=labels.num_items,
         q_z=FreeCategoricalZ(labels.num_items, labels.num_classes, init_probs=class_probs),
-        ##!! Study FreeCategoricalZ file
     )
 
-    def report(iteration: int, elbo: float) -> None: ## Defines how to report the 
-                                                      # training process in callback. 
+    # Feature-dependent variant: confusion matrices vary with the item features.
+    feature_model = GPCrowdModel(
+        latent=SVGPLatent(
+            kernel=gpflow.kernels.SquaredExponential(lengthscales=2.0),
+            num_classes=labels.num_classes,
+            inducing_points=data.X[:25].copy(),
+        ),
+        annotator=FeatDepVariationalDirichletAnnotator(
+            labels.num_workers,
+            labels.num_classes,
+            hidden_units=[32, 32],
+        ),
+        num_data=labels.num_items,
+        q_z=FreeCategoricalZ(labels.num_items, labels.num_classes, init_probs=class_probs),
+    )
+
+    def report(iteration: int, elbo: float) -> None:
         if iteration % 50 == 0:
             print(f"  iter {iteration:4d}   elbo {elbo:12.2f}")
 
-    print("\nTraining ...")
+    print("\nTraining baseline model...")
+    baseline_history = train(
+        baseline_model, data.X, labels, iterations=300, learning_rate=0.05, callback=report
+    )
 
-    ## train(...) trains the model, saves the results in history and prints the evolution
-    history = train(model, data.X, labels, iterations=300, learning_rate=0.05, callback=report)
+    print("\nTraining feature-dependent model...")
+    feature_history = train(
+        feature_model, data.X, labels, iterations=300, learning_rate=0.05, callback=report
+    )
 
-    mv_acc = accuracy(labels.majority_vote(), data.z) ## Basic baseline, could 
-                                                       # implement extra baselines as DS, GLAD...
-    model_acc = accuracy(model.infer_true_labels(tf.constant(data.X), labels), data.z)
-    ## (up): Obtains predictions with the trained model, and calculates the accuracy.
+    mv_acc = accuracy(labels.majority_vote(), data.z)
+    baseline_acc = accuracy(baseline_model.infer_true_labels(tf.constant(data.X), labels), data.z)
+    feature_acc = accuracy(feature_model.infer_true_labels(tf.constant(data.X), labels), data.z)
 
-    ## Prints mean ELBO values for the first and last iterations
-    print("\nELBO decomposition, first vs last 10 iterations:")
+    print("\nELBO decomposition, first vs last 10 iterations (baseline):")
     for name, series in [
-        ("latent", history.latent),
-        ("crowd", history.crowd),
-        ("entropy", history.entropy),
-        ("kl_latent", history.kl_latent),
-        ("kl_annotator", history.kl_annotator),
-        ("total_elbo", history.elbo) # Añadido para ver si mejora la suma promedio
+        ("latent", baseline_history.latent),
+        ("crowd", baseline_history.crowd),
+        ("entropy", baseline_history.entropy),
+        ("kl_latent", baseline_history.kl_latent),
+        ("kl_annotator", baseline_history.kl_annotator),
+        ("total_elbo", baseline_history.elbo),
     ]:
         print(f"  {name:12s} {np.mean(series[:10]):12.2f} -> {np.mean(series[-10:]):12.2f}")
 
     print("\nAccuracy against the (normally hidden) true labels:")
     print(f"  majority vote : {mv_acc:.3f}")
-    print(f"  gpcrowdkit model : {model_acc:.3f}")
+    print(f"  baseline model : {baseline_acc:.3f}")
+    print(f"  feature-dependent model : {feature_acc:.3f}")
 
-    ## Measure how well the model recovers the (static) confusion matrices.
-     # Must be redefined and deeply thought if feature dependence is considered. 
-    est_confusion = model.annotator.confusion_matrices().numpy()
+    est_confusion = baseline_model.annotator.confusion_matrices().numpy()
     confusion_mae = np.abs(est_confusion - data.confusion).mean()
     print(f"\nMean absolute error of recovered worker confusion matrices: {confusion_mae:.3f}")
 
-    ## Perogrullo's calling: if model doesn't beat MajVoting, it is useless.
-    assert model_acc > mv_acc, "sanity check failed: the model did not beat majority vote"
-    print("\nSanity check passed: the model beat majority vote.")
+    assert baseline_acc > mv_acc, "sanity check failed: the baseline model did not beat majority vote"
+    print("\nSanity check passed: the baseline model beat majority vote.")
+    print("Feature-dependent variant was also trained and evaluated in the same script.")
 
 
 if __name__ == "__main__":
