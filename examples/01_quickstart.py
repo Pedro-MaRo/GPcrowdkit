@@ -78,7 +78,9 @@ def main() -> None:
         annotator=FeatDepVariationalDirichletAnnotator(
             labels.num_workers,
             labels.num_classes,
+            data.X,
             hidden_units=[32, 32],
+            alpha_tilde_init=init_alpha_tilde(labels, class_probs),
         ),
         num_data=labels.num_items,
         q_z=FreeCategoricalZ(labels.num_items, labels.num_classes, init_probs=class_probs),
@@ -88,14 +90,19 @@ def main() -> None:
         if iteration % 50 == 0:
             print(f"  iter {iteration:4d}   elbo {elbo:12.2f}")
 
+    # iterations=1500 is just an upper bound: early_stopping lets each model stop on its
+    # own once its ELBO stops improving, rather than both training for the same fixed
+    # count regardless of how quickly each actually converges.
     print("\nTraining baseline model...")
     baseline_history = train(
-        baseline_model, data.X, labels, iterations=300, learning_rate=0.05, callback=report
+        baseline_model, data.X, labels, iterations=1500, learning_rate=0.05,
+        callback=report, early_stopping=True,
     )
 
     print("\nTraining feature-dependent model...")
     feature_history = train(
-        feature_model, data.X, labels, iterations=300, learning_rate=0.05, callback=report
+        feature_model, data.X, labels, iterations=1500, learning_rate=0.05,
+        callback=report, early_stopping=True,
     )
 
     mv_acc = accuracy(labels.majority_vote(), data.z)
@@ -115,8 +122,8 @@ def main() -> None:
 
     print("\nAccuracy against the (normally hidden) true labels:")
     print(f"  majority vote : {mv_acc:.3f}")
-    print(f"  baseline model : {baseline_acc:.3f}")
-    print(f"  feature-dependent model : {feature_acc:.3f}")
+    print(f"  baseline model : {baseline_acc:.3f}   ({len(baseline_history.elbo)} iterations used)")
+    print(f"  feature-dependent model : {feature_acc:.3f}   ({len(feature_history.elbo)} iterations used)")
 
     est_confusion = baseline_model.annotator.confusion_matrices().numpy()
     confusion_mae = np.abs(est_confusion - data.confusion).mean()

@@ -1,0 +1,48 @@
+# ## CONCH backbone (default): pathology foundation model, 512-d patch embeddings.
+
+name: ai4skin
+data_root: ../AI4SkINv2-2   # Path to the AI4SkINv2-2 checkout (sibling of this repo); override for your machine.
+backbone: CONCH              # One of CONCH, PLIP, UNI, VGG16IN -- see AI4SkINv2-2/embeddings_v3/.
+pooling: mean                # How to collapse each WSI's [n_patches, D] bag of patch embeddings into one feature vector.
+include_val_in_train: true   # Merge AI4SkINv2-2's val split (also has crowd annotations) into the annotated training pool.
+standardize: true            # Z-score features using train-split statistics (also applied to the test split).
+
+
+# ## UNI backbone (1024-d; generally the strongest of the four for histopathology)
+
+# name: ai4skin
+# data_root: ../AI4SkINv2-2
+# backbone: UNI
+# pooling: mean
+# include_val_in_train: true
+# standardize: true
+
+
+# ## PLIP backbone
+
+# name: ai4skin
+# data_root: ../AI4SkINv2-2
+# backbone: PLIP
+# pooling: mean
+# include_val_in_train: true
+# standardize: true
+
+
+# ## VGG16IN backbone (ImageNet-pretrained VGG16, non-pathology-specific baseline)
+
+# name: ai4skin
+# data_root: ../AI4SkINv2-2
+# backbone: VGG16IN
+# pooling: mean
+# include_val_in_train: true
+# standardize: true
+
+
+# ## Train-only (exclude val; matches train.csv's own DS/GLAD/MACE aggregator columns exactly, at the cost of less training data)
+
+# name: ai4skin
+# data_root: ../AI4SkINv2-2
+# backbone: CONCH
+# pooling: mean
+# include_val_in_train: false
+# standardize: true

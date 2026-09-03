@@ -34,7 +34,7 @@ def accuracy(pred: np.ndarray, true: np.ndarray) -> float:
     return float(np.mean(np.asarray(pred) == np.asarray(true)))
 
 
-def build_annotator(cls: type[AnnotatorModel], labels, class_probs) -> AnnotatorModel:
+def build_annotator(cls: type[AnnotatorModel], labels, class_probs, X: np.ndarray) -> AnnotatorModel:
     """The only place that knows which strategy is which."""
     if cls is ALL_ANNOTATOR_STRATEGIES[0]:
         return cls(
@@ -43,9 +43,15 @@ def build_annotator(cls: type[AnnotatorModel], labels, class_probs) -> Annotator
             alpha_tilde_init=init_alpha_tilde(labels, class_probs),
         )
     if cls is FeatDepVariationalDirichletAnnotator:
-        # This strategy produces a different confusion matrix for each item via X,
-        # so it does not use the static alpha_tilde initialisation.
-        return cls(labels.num_workers, labels.num_classes, hidden_units=[32, 32])
+        # This strategy produces a different confusion matrix for each item via X, but
+        # the X-independent baseline it corrects can still be vote-seeded like the static
+        # strategy above. It also needs the full X: its kl_divergence() must cover the
+        # whole dataset every call, to match the other strategies' "complete every batch"
+        # KL contract.
+        return cls(
+            labels.num_workers, labels.num_classes, X, hidden_units=[32, 32],
+            alpha_tilde_init=init_alpha_tilde(labels, class_probs),
+        )
     return cls(labels.num_workers, labels.num_classes)
 
 
@@ -70,7 +76,10 @@ def main() -> None:
     print(f"{'strategy':<28s} {'params/worker':>14s} {'accuracy':>10s} {'final elbo':>12s}")
     print(f"{'majority vote (baseline)':<28s} {'-':>14s} {mv_acc:>10.3f} {'-':>12s}")
 
-    ## For each strategy, build, train and evaluate a model. 
+    # (strategy, params/worker, accuracy, iterations used) for the final summary table.
+    rows = []
+
+    ## For each strategy, build, train and evaluate a model.
     for cls in strategies:
         model = GPCrowdModel(
             latent=SVGPLatent(
@@ -78,17 +87,30 @@ def main() -> None:
                 num_classes=labels.num_classes,
                 inducing_points=data.X[:20].copy(),
             ),
-            annotator=build_annotator(cls, labels, class_probs),
+            annotator=build_annotator(cls, labels, class_probs, data.X),
             num_data=labels.num_items,
             q_z=FreeCategoricalZ(labels.num_items, labels.num_classes, init_probs=class_probs),
         )
-        history = train(model, data.X, labels, iterations=300, learning_rate=0.05)
+        # iterations=2000 is just an upper bound: early_stopping lets each strategy stop
+        # on its own once its ELBO stops improving, rather than all training for the same
+        # fixed count -- a low-capacity strategy like OneCoinAnnotator converges and stops
+        # in a fraction of what a higher-capacity one like FeatDepDirichletAnnotator needs.
+        history = train(
+            model, data.X, labels, iterations=2000, learning_rate=0.05, early_stopping=True,
+        )
         acc = accuracy(model.infer_true_labels(tf.constant(data.X), labels), data.z)
         params_per_worker = sum(np.prod(v.shape) for v in model.annotator.trainable_variables) / (
             labels.num_workers or 1
         )
-        print(f"\n{'strategy':<28s} {'params/worker':>14s} {'accuracy':>10s} {'final elbo':>12s}")
-        print(f"{cls.__name__:<28s} {params_per_worker:>14.0f} {acc:>10.3f} {history.elbo[-1]:>12.2f}")
+        rows.append((cls.__name__, params_per_worker, acc, len(history.elbo)))
+        print(
+            f"\n{'strategy':<28s} {'params/worker':>14s} {'accuracy':>10s} "
+            f"{'final elbo':>12s} {'iterations':>11s}"
+        )
+        print(
+            f"{cls.__name__:<28s} {params_per_worker:>14.0f} {acc:>10.3f} "
+            f"{history.elbo[-1]:>12.2f} {len(history.elbo):>11d}"
+        )
         ## Check the decomposition of the ELBO for each strategy.
         print(f"ELBO decomposition for {cls.__name__}, first vs last 10 iterations:")
         for name, series in [
@@ -100,7 +122,12 @@ def main() -> None:
             ("total_elbo", history.elbo) # Añadido para ver si mejora la suma promedio
         ]:
             print(f"  {name:12s} {np.mean(series[:10]):12.2f} -> {np.mean(series[-10:]):12.2f}")
-    
+
+    print("\n\n=== Comparison summary ===")
+    print(f"{'strategy':<28s} {'params/worker':>14s} {'accuracy':>10s} {'iterations':>11s}")
+    print(f"{'majority vote (baseline)':<28s} {'-':>14s} {mv_acc:>10.3f} {'-':>11s}")
+    for name, params, acc, n_iterations in rows:
+        print(f"{name:<28s} {params:>14.0f} {acc:>10.3f} {n_iterations:>11d}")
 
 
 if __name__ == "__main__":

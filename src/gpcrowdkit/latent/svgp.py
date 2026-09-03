@@ -179,3 +179,21 @@ class SVGPLatent(LatentFunction):
             say so.
         """
         return self.svgp.predict_y(X)[0]
+
+    def gp_hyperparameters(self) -> tuple[tf.Variable, ...]:
+        """See [gp_hyperparameters][gpcrowdkit.latent.base.LatentFunction.gp_hyperparameters].
+
+        Kernel hyperparameters, inducing-point locations, and the mean
+        function (if it has any parameters) -- Θ in the paper's Algorithm 1.
+        Deliberately excludes ``svgp.q_mu``/``svgp.q_sqrt`` (the paper's
+        ``m_k``/``S_k``), which belong to the variational parameters ``V``
+        that warm-up keeps fitting.
+
+        Returns:
+            tuple[tf.Variable, ...]: Non-empty for any real kernel.
+        """
+        variables = tuple(self.svgp.kernel.trainable_variables)
+        variables += tuple(self.svgp.inducing_variable.trainable_variables)
+        if self.svgp.mean_function is not None:
+            variables += tuple(self.svgp.mean_function.trainable_variables)
+        return variables

@@ -29,6 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 examples = ["matplotlib>=3.5"]
+data = ["scikit-learn>=1.3", "pyyaml>=6.0", "matplotlib>=3.5"]
 docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",

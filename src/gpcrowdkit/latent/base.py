@@ -76,3 +76,22 @@ class LatentFunction(gpflow.Module, abc.ABC):
         Returns:
             tf.Tensor: Shape ``[B, C]``, rows summing to 1.
         """
+
+    def gp_hyperparameters(self) -> tuple[tf.Variable, ...]:
+        """Variables making up 'Θ, the parameters of the Gaussian Processes' (paper Algorithm 1).
+
+        Used only by [train][gpcrowdkit.inference.train]'s warm-up phase, which
+        fits every other variational parameter (`q(Z)`, `q(U)`, an annotator's
+        parameters) while holding exactly these frozen -- Algorithm 1's first
+        loop, before the GP hyperparameters themselves start moving. Explicitly
+        *not* `q(U)`'s variational parameters (the paper's ``m_k``/``S_k``):
+        those belong to `V` and stay trainable throughout.
+
+        The default is empty, so a `LatentFunction` that does not override this
+        makes warm-up a no-op rather than an error -- training proceeds exactly
+        as if `warmup_iterations` had been left at 0.
+
+        Returns:
+            tuple[tf.Variable, ...]: Possibly empty.
+        """
+        return ()

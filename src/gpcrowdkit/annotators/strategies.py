@@ -7,14 +7,15 @@ anywhere else in the library.
 
 They span the useful range of complexity:
 
-============================            ==================  ==============================
-Strategy                                Parameters          Worker uncertainty
-============================            ==================  ==============================
-VariationalDirichletAnnotator           ``A * C * C``       full posterior over ``R``
-SoftmaxPointAnnotator                   ``A * C * C``       none (point estimate)
-OneCoinAnnotator                        ``A``               none (point estimate)
-FeatDepDirichletAnnotator               ``N * A * C * C``   full posterior over ``R``
-============================            ==================  ==============================
+============================            =========================  ==============================
+Strategy                                Parameters                 Worker uncertainty
+============================            =========================  ==============================
+VariationalDirichletAnnotator           ``A * C * C``              full posterior over ``R``
+SoftmaxPointAnnotator                   ``A * C * C``              none (point estimate)
+OneCoinAnnotator                        ``A``                      none (point estimate)
+FeatDepDirichletAnnotator               ``O(hidden)``, shared      full posterior over ``R(X)``
+                                         across ``A`` and ``C``
+============================            =========================  ==============================
 
 [OneCoinAnnotator][gpcrowdkit.annotators.strategies.OneCoinAnnotator] is the one that justifies the shape of the base
 class. It carries a single scalar per worker, so an interface promising an
@@ -383,45 +384,239 @@ def init_alpha_tilde(
     return acc + prior_strength
 
 
+def _inverse_softplus(x: np.ndarray) -> np.ndarray:
+    """Inverts ``softplus``: returns ``y`` such that ``log1p(exp(y)) == x``.
+
+    Used to seed `FeatDepDirichletAnnotator`'s baseline table so that
+    ``softplus(baseline) + 1e-3`` reproduces a target concentration array
+    (typically [init_alpha_tilde][gpcrowdkit.annotators.strategies.init_alpha_tilde]'s output) exactly at
+    initialisation. ``log(expm1(x))`` rather than ``log(exp(x) - 1)``: `expm1`
+    avoids the catastrophic cancellation of computing ``exp(x) - 1`` directly
+    for the modest, near-1 concentrations `init_alpha_tilde` produces.
+
+    Args:
+        x: Positive array, shape arbitrary.
+
+    Returns:
+        np.ndarray: Same shape as ``x``.
+    """
+    return np.log(np.expm1(np.maximum(x, 1e-6)))
+
+
 class FeatDepDirichletAnnotator(AnnotatorModel):
-    """ Variational Dirichlet Strategy with feature-dependent confusion matrices. 
-    
+    """ Variational Dirichlet Strategy with feature-dependent confusion matrices.
+
     note: It inherits from AnnotatorModel instead of ConfusionAnnotator because
     the confusion matrices are now dependent on the input features X, and the implementation
     doesn't match the structure of ConfusionAnnotator.
 
+    Per the paper's Eq. 2 ("a neural network which receives the annotator,
+    features, and true class... and produces K values"), the network is a
+    single shared trunk taking ``(x_n, annotator, true class)`` as explicit
+    inputs and returning the ``C`` concentrations of *one* Dirichlet column --
+    not, as a network that only ever saw ``X`` would have to, a private
+    ``A * C * C``-sized output block computed once per item and sliced by
+    annotator. Annotator identity is a small trainable embedding rather than
+    a one-hot (the paper does not specify which; an embedding keeps the
+    parameter count from scaling with ``A`` and lets the model discover
+    annotators with similar behaviour); true class is a one-hot, since ``C``
+    is fixed and small. Every ``(annotator, true class)`` combination is
+    evaluated in one batched forward pass -- ``get_alpha_tilde`` below -- so
+    this stays compatible with ``tf.function`` the same way
+    [AnnotatorModel.crowd_log_per_item][gpcrowdkit.annotators.base.AnnotatorModel.crowd_log_per_item]'s
+    vectorised segment-sum avoids a Python loop over annotators.
+
+    ``alpha_tilde(x, a, j)`` is a residual: a per-``(a, j)`` trainable
+    baseline table, initialised (like `VariationalDirichletAnnotator`'s own
+    `alpha_tilde`) from `init_alpha_tilde`, plus a correction from the shared
+    trunk above whose *last layer* starts at exactly zero. At step 0 the
+    correction contributes nothing, so this strategy starts numerically
+    identical to `VariationalDirichletAnnotator` -- vote-based, ``X``-free --
+    and only differentiates by ``X`` as training moves the trunk's weights
+    away from zero. Without this, the trunk starts from Keras' default random
+    init: a flat, uninformative Dirichlet column for every annotator and
+    class, independent of ``X``, which is exactly the symmetric starting
+    point `init_alpha_tilde`'s docstring warns can settle into "a labelling
+    that is a permutation of the truth".
+
+    ``x`` itself is not fed to the trunk directly: a linear, no-activation
+    ``feature_proj`` layer first maps it ``D -> feature_bottleneck_dim``. Almost
+    the entire parameter count of a naive version of this strategy comes from
+    exactly this step -- the trunk's first hidden layer's ``D``-columns block,
+    where ``D`` is whatever a foundation-model backbone happens to embed items
+    in (512-1024 for AI4SkINv2-2's backbones), not anything intrinsic to how
+    complex "annotator reliability as a function of item content" actually is.
+    Low-rank-factorising that block into ``D -> r -> hidden`` instead of
+    ``D -> hidden`` directly cuts parameters roughly in proportion to
+    ``r / hidden_units[0]`` without touching what the trunk can subsequently
+    do with ``(x, annotator, class)`` -- and because ``feature_proj`` is
+    trained end-to-end through the same ELBO gradient as everything else, it
+    orients itself toward whichever directions of ``X`` the data says predict
+    annotator reliability, rather than (say) a fixed PCA's variance-maximising
+    ones. It is also computed once per item and *then* tiled across every
+    ``(annotator, class)`` combination (see `get_alpha_tilde`), rather than
+    tiling ``x`` first: the projection no longer does ``A * C`` redundant
+    copies of the same computation.
     """
 
     def __init__(
         self,
         num_workers: int,
         num_classes: int,
+        X: np.ndarray,
         hidden_units: list[int] = [64, 64],
+        annotator_embedding_dim: int = 8,
+        feature_bottleneck_dim: int | None = 1,
         alpha_prior: float = 1.0,
+        alpha_tilde_init: np.ndarray | None = None,
         name: str | None = None,
     ) -> None:
+        """Initialises the feature-dependent Dirichlet annotator.
+
+        Args:
+            num_workers: Number of annotators ``A``.
+            num_classes: Number of classes ``C``.
+            X: Full training feature matrix, shape ``[N, D]``. Only its row
+                count ``N`` is kept (not the array itself): `kl_divergence`
+                needs it to rescale a batch-only estimate up to a full-dataset
+                one, the same ``N/B`` correction
+                [ELBOTerms.total][gpcrowdkit.models.ELBOTerms.total] already
+                applies to the ``latent``/``crowd``/``entropy`` terms.
+            hidden_units: Hidden layer widths of the shared
+                ``(x_proj, annotator, true class) -> alpha_tilde column`` trunk,
+                run on the *projected* features -- see `feature_bottleneck_dim`.
+            annotator_embedding_dim: Width of the trainable annotator
+                embedding fed to the trunk alongside ``x_proj`` and the
+                one-hot true class.
+            feature_bottleneck_dim: Width ``r`` of the linear, no-activation
+                projection ``D -> r`` applied to ``x`` before it reaches the
+                trunk. See the class docstring for why this is where most of
+                this strategy's parameters would otherwise go, and why
+                shrinking it is expected to cost little to no expressiveness
+                for this task specifically. Silently capped at ``D`` (the
+                actual feature width): a "bottleneck" wider than the input it
+                bottlenecks would expand rather than shrink that block --
+                harmless on real foundation-model features (``D`` in the
+                hundreds), but exactly what would happen by default on a
+                toy 2-D dataset otherwise. Pass ``None`` to disable the
+                bottleneck entirely and feed raw ``x`` to the trunk, the
+                behaviour before this parameter existed -- an easy way to
+                rule it out when comparing against or debugging that earlier
+                behaviour, without deleting `feature_proj` or anything that
+                uses it.
+            alpha_prior: Prior concentration, broadcast over ``[A, C, C]``.
+            alpha_tilde_init: Optional ``[A, C, C]`` starting point for the
+                ``X``-independent baseline table, in the same shape and
+                convention as `VariationalDirichletAnnotator`'s own parameter
+                of the same name -- typically
+                [init_alpha_tilde][gpcrowdkit.annotators.strategies.init_alpha_tilde],
+                so both strategies can be seeded from the same call. Defaults
+                to the same mild diagonal bias `VariationalDirichletAnnotator`
+                falls back to when unset.
+            name: Optional module name, forwarded to ``gpflow.Module``.
+        """
         super().__init__(num_workers, num_classes, name=name)
 
         # Non-trainable alpha prior [1,A,C,C] for broadcasting over batch B.
         prior_array = np.full((1, self.A, self.C, self.C), alpha_prior, dtype=np.float64)
         self.alpha = gpflow.Parameter(prior_array, transform=positive(), trainable=False)
 
-        # Neural network X -> [B, A * C * C]
+        # Linear D -> r bottleneck, trained jointly with everything else. See the
+        # class docstring: this low-rank-factorises what would otherwise be the
+        # trunk's first layer's D-columns block, its largest piece by far.
+        # Capped at D so it can only ever shrink, never expand, that block.
+        # feature_bottleneck_dim=None turns it into a plain pass-through (tf.identity
+        # has no parameters and isn't a tf.Module, so it contributes nothing to
+        # trainable_variables) -- an easy toggle back to feeding raw x to the trunk,
+        # with nothing to delete or re-add either way.
+        if feature_bottleneck_dim is None:
+            self.feature_proj = tf.identity
+        else:
+            feature_dim = int(np.asarray(X).shape[1])
+            feature_bottleneck_dim = min(feature_bottleneck_dim, feature_dim)
+            self.feature_proj = tf.keras.layers.Dense(feature_bottleneck_dim, dtype=FLOAT)
+
+        # Annotator identity is a learned embedding; true class is one-hot inside
+        # get_alpha_tilde (C is fixed and small, unlike A which can be large).
+        self.annotator_embed = tf.keras.layers.Embedding(self.A, annotator_embedding_dim, dtype=FLOAT)
+
+        # Shared trunk: (x_proj, annotator_embedding, true_class_onehot) -> the C
+        # concentrations of that one Dirichlet column, as a *correction* added
+        # to the data-driven baseline built below. The last layer's kernel and
+        # bias are zero-initialised -- the standard "zero-init the residual
+        # branch" trick -- so this correction is exactly 0 for every input at
+        # step 0 regardless of the (randomly initialised) hidden layers, the
+        # embedding, or feature_proj: only the baseline determines alpha_tilde
+        # initially.
         layers = []
         for units in hidden_units:
             layers.append(tf.keras.layers.Dense(units, activation="relu", dtype=FLOAT))
-        layers.append(tf.keras.layers.Dense(self.A * self.C * self.C, dtype=FLOAT))
+        layers.append(tf.keras.layers.Dense(
+            self.C, dtype=FLOAT, kernel_initializer="zeros", bias_initializer="zeros",
+        ))
         self.net = tf.keras.Sequential(layers)
-        # Internal cache of tensor X of actual batch, for kl_divergence()
+
+        # Precomputed (annotator, true_class) combination pattern shared by every
+        # item: length A*C, combo k = a*C + j. See get_alpha_tilde().
+        self._ann_per_combo = tf.constant(np.repeat(np.arange(self.A), self.C), dtype=tf.int32)
+        self._class_per_combo = tf.constant(np.tile(np.arange(self.C), self.A), dtype=tf.int32)
+        self._combo_idx = tf.constant(np.arange(self.A * self.C), dtype=tf.int32)
+
+        # X-independent, per-(annotator, true class) baseline, trainable so it
+        # keeps refining beyond its initial value -- effectively this
+        # strategy's own analogue of VariationalDirichletAnnotator.alpha_tilde,
+        # with the trunk above contributing whatever X-dependent correction
+        # the data supports on top of it.
+        if alpha_tilde_init is None:
+            alpha_tilde_init = np.full((self.A, self.C, self.C), 1.0 / self.C) + np.stack(
+                [np.eye(self.C) for _ in range(self.A)]
+            )
+        baseline_logits = _inverse_softplus(np.asarray(alpha_tilde_init, dtype=np.float64) - 1e-3)
+        # [A, C_obs, C_true] -> [A, C_true, C_obs] -> [A*C, C_obs], combo k = a*C+j.
+        baseline_logits = np.transpose(baseline_logits, (0, 2, 1)).reshape(self.A * self.C, self.C)
+        self._alpha_tilde_baseline = tf.keras.layers.Embedding(
+            self.A * self.C, self.C, dtype=FLOAT,
+            embeddings_initializer=tf.keras.initializers.Constant(baseline_logits),
+        )
+
+        # Dataset size, for the N/B rescaling in kl_divergence() -- see there.
+        self._num_items = int(np.asarray(X).shape[0])
+        # Cache of the most recent batch's X, used by kl_divergence() and by
+        # confusion_matrices() for reporting.
         self._last_X: tf.Tensor | None = None
 
     def get_alpha_tilde(self, X: tf.Tensor) -> tf.Tensor:
-        """
-        Returns alpha_tilde(X) with shape [B, A, C, C]
+        """Returns alpha_tilde(X) with shape [B, A, C_obs, C_true].
+
+        Projects ``X`` to `feature_bottleneck_dim` *once*, then builds one row
+        of ``(x_proj, annotator_embedding, true_class_onehot)`` per item per
+        ``(annotator, true class)`` combination -- ``B * A * C`` rows total --
+        and runs all of them through the shared trunk in a single batched
+        call, rather than looping over ``A`` and ``C`` in Python (or
+        recomputing the ``D -> r`` projection redundantly for every combo, by
+        projecting before tiling instead of after). The trunk's output is
+        added to the data-driven, ``X``-independent baseline (see the class
+        docstring) rather than used on its own.
         """
         B = tf.shape(X)[0]
-        raw_out = self.net(X)
-        reshaped = tf.reshape(raw_out, (B, self.A, self.C, self.C))
+        AC = self.A * self.C
+
+        x_proj = self.feature_proj(X)  # [B, r] -- the expensive D-dim step, done once
+        x_proj_tiled = tf.repeat(x_proj, repeats=AC, axis=0)  # [B*A*C, r]
+        ann_ids = tf.tile(self._ann_per_combo, [B])  # [B*A*C]
+        true_class = tf.tile(self._class_per_combo, [B])  # [B*A*C]
+        combo_ids = tf.tile(self._combo_idx, [B])  # [B*A*C]
+
+        ann_embed = self.annotator_embed(ann_ids)  # [B*A*C, E]
+        class_onehot = tf.one_hot(true_class, self.C, dtype=FLOAT)  # [B*A*C, C]
+
+        net_in = tf.concat([x_proj_tiled, ann_embed, class_onehot], axis=-1)
+        correction = self.net(net_in)  # [B*A*C, C_obs], ~0 at initialisation
+        baseline = self._alpha_tilde_baseline(combo_ids)  # [B*A*C, C_obs], X-independent
+        raw_out = baseline + correction  # the K values of Eq. 2
+
+        reshaped = tf.reshape(raw_out, (B, self.A, self.C, self.C))  # [B, A, C_true, C_obs]
+        reshaped = tf.transpose(reshaped, perm=[0, 1, 3, 2])  # [B, A, C_obs, C_true]
         return tf.nn.softplus(reshaped) + 1e-3
 
     def expected_log_confusion_all(self, X: tf.Tensor) -> tf.Tensor:
@@ -448,14 +643,35 @@ class FeatDepDirichletAnnotator(AnnotatorModel):
         return tf.gather_nd(E_log_R, idx)
 
     def kl_divergence(self) -> tf.Tensor:
-        """
-        Base Contract: Returns KL-divergence scalar over the batch.
+        """``KL(q(R|X) || p(R))``, estimated from the current batch and rescaled to the full dataset.
+
+        Unlike `VariationalDirichletAnnotator`'s KL, which lives on a fixed
+        ``[A, C, C]`` tensor and is genuinely complete regardless of batch,
+        ``alpha_tilde`` here is a function of each item's own ``x_n`` -- so the
+        *true* KL is itself a sum over all ``N`` items, exactly like the
+        ``latent``/``crowd``/``entropy`` terms `GPCrowdModel.elbo_terms` computes.
+        `ELBOTerms.total` doesn't know that: it always adds `kl_annotator`
+        unscaled, on the assumption -- correct for the global-parameter
+        strategies -- that it is already complete. Rather than making that true
+        by evaluating the network over every training item on every call (an
+        earlier version of this method did exactly that), this reproduces the
+        *effect* of the model's own ``N/B`` correction from inside the
+        strategy itself: sum the KL over the batch `label_log_terms` already
+        computed (`self._last_X`, no extra forward pass needed) and scale by
+        ``N/B``, the identical factor `ELBOTerms.total` applies to the data
+        terms. This is the standard stochastic-VI treatment of a per-item KL
+        under minibatching -- an unbiased estimate of the full sum on every
+        call, not the exact value, in exchange for ``O(B)`` instead of
+        ``O(N)`` work per step.
+
+        Returns:
+            tf.Tensor: Scalar.
         """
         if self._last_X is None:
             return tf.constant(0.0, dtype=FLOAT)
 
         q = self.get_alpha_tilde(self._last_X)  # [B, A, C_obs, C_true]
-        p = self.alpha                         # [1, A, C_obs, C_true]
+        p = self.alpha                          # [1, A, C_obs, C_true]
 
         diff = q - p
         term1 = tf.reduce_sum(diff * tf.math.digamma(q))
@@ -468,7 +684,10 @@ class FeatDepDirichletAnnotator(AnnotatorModel):
         p_trans = tf.transpose(p, perm=[0, 1, 3, 2])
         term3 = tf.reduce_sum(tf.math.lbeta(p_trans) - tf.math.lbeta(q_trans))
 
-        return term1 + term2 + term3
+        batch_kl = term1 + term2 + term3
+        batch_size = tf.cast(tf.shape(self._last_X)[0], FLOAT)
+        scale = tf.cast(self._num_items, FLOAT) / batch_size
+        return batch_kl * scale
 
     def confusion_matrices(self, X: tf.Tensor | None = None) -> tf.Tensor:
         """
