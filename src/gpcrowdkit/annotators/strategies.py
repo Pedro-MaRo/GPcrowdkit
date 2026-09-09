@@ -466,7 +466,7 @@ class FeatDepDirichletAnnotator(AnnotatorModel):
         X: np.ndarray,
         hidden_units: list[int] = [64, 64],
         annotator_embedding_dim: int = 8,
-        feature_bottleneck_dim: int | None = 1,
+        feature_bottleneck_dim: int | None = 150,
         alpha_prior: float = 1.0,
         alpha_tilde_init: np.ndarray | None = None,
         name: str | None = None,
